@@ -10,7 +10,11 @@ class ReplayBuffer:
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
+        # Add safety check to ensure we have enough samples
+        if len(self.buffer) < batch_size:
+            raise ValueError(f"Not enough samples in buffer. Required: {batch_size}, Available: {len(self.buffer)}")
+        
+        batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
             np.stack(states, axis=0),
@@ -22,3 +26,7 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+    
+    def can_sample(self, batch_size):
+        """Check if buffer has enough samples for the requested batch size"""
+        return len(self.buffer) >= batch_size

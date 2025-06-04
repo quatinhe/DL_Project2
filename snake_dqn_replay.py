@@ -44,7 +44,8 @@ def preprocess_state(state):
     return state_tensor.unsqueeze(0)  # Add batch dimension
 
 def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99, 
-                         batch_size=32, buffer_size=10000, visualize=False):
+                         batch_size=32, buffer_size=10000, target_update_freq=100, 
+                         min_buffer_size=1000, visualize=False):
     scores = []
     q_values = []
     training_times = []
@@ -58,8 +59,35 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
     # Initialize replay buffer
     replay_buffer = ReplayBuffer(capacity=buffer_size)
     
+    # Initialize target network
+    target_model = DQN().to(device)
+    target_model.load_state_dict(model.state_dict())
+    target_model.eval()
+    
+    # Step counter for target network updates
+    step_counter = 0
+    
     if visualize:
         visualizer = SnakeVisualizer(env.width, env.height)
+    
+    # Initial Population (Warm Start): Fill buffer with random experiences
+    print(f"Warming up replay buffer with {min_buffer_size} experiences...")
+    state, _, done, _ = env.reset()
+    
+    while len(replay_buffer) < min_buffer_size:
+        # Use random action for warm start
+        action = np.random.randint(-1, 2)
+        next_state, reward, done, _ = env.step(action)
+        
+        # Store experience in replay buffer
+        replay_buffer.add(state, action, reward, next_state, done)
+        
+        state = next_state if not done else env.reset()[0]
+        
+        if len(replay_buffer) % 100 == 0:
+            print(f"Buffer filled: {len(replay_buffer)}/{min_buffer_size}")
+    
+    print(f"Warm-up complete! Buffer size: {len(replay_buffer)}")
     
     for episode in range(num_episodes):
         state, _, done, _ = env.reset()
@@ -96,8 +124,11 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
             # Store experience in replay buffer
             replay_buffer.add(state, action, reward, next_state, done)
             
+            # Increment step counter
+            step_counter += 1
+            
             # Train on batch if buffer has enough samples
-            if len(replay_buffer) >= batch_size:
+            if replay_buffer.can_sample(batch_size):
                 # Sample batch from replay buffer
                 batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = replay_buffer.sample(batch_size)
                 
@@ -111,9 +142,9 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
                 # Compute current Q values
                 current_q_values = model(batch_states).gather(1, batch_actions.unsqueeze(1))
                 
-                # Compute next Q values
+                # Compute next Q values using TARGET NETWORK
                 with torch.no_grad():
-                    next_q_values = model(batch_next_states).max(1)[0]
+                    next_q_values = target_model(batch_next_states).max(1)[0]
                     target_q_values = batch_rewards + (gamma * next_q_values * ~batch_dones)
                 
                 # Compute loss
@@ -124,6 +155,11 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                
+                # Update target network periodically
+                if step_counter % target_update_freq == 0:
+                    target_model.load_state_dict(model.state_dict())
+                    print(f"Target network updated at step {step_counter}")
             
             state = next_state
         
@@ -137,7 +173,7 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
             print(f"Episode {episode}, Score: {episode_score}, "
                   f"Avg Q-value: {np.mean(episode_q_values):.2f}, "
                   f"Epsilon: {epsilon:.4f}, Loss: {np.mean(episode_losses) if episode_losses else 0:.4f}, "
-                  f"Time: {training_time:.2f}s")
+                  f"Time: {training_time:.2f}s, Buffer: {len(replay_buffer)}")
             
             # Save metrics every 10 episodes
             metrics = {
@@ -147,7 +183,8 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
                 'epsilon': float(epsilon),
                 'avg_loss': float(np.mean(episode_losses) if episode_losses else 0),
                 'training_time': float(training_time),
-                'buffer_size': len(replay_buffer)
+                'buffer_size': len(replay_buffer),
+                'step_counter': step_counter
             }
             with open(os.path.join(results_dir, 'metrics.json'), 'a') as f:
                 json.dump(metrics, f)
@@ -156,8 +193,9 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
     if visualize:
         pygame.quit()
     
-    # Save final model
+    # Save final model and target model
     torch.save(model.state_dict(), os.path.join(results_dir, 'model.pth'))
+    torch.save(target_model.state_dict(), os.path.join(results_dir, 'target_model.pth'))
     
     # Create and save plots
     plt.figure(figsize=(20, 5))
@@ -200,7 +238,10 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
         'total_training_time': float(np.sum(training_times)),
         'num_episodes': num_episodes,
         'buffer_size': buffer_size,
-        'batch_size': batch_size
+        'batch_size': batch_size,
+        'target_update_freq': target_update_freq,
+        'min_buffer_size': min_buffer_size,
+        'total_steps': step_counter
     }
     with open(os.path.join(results_dir, 'final_metrics.json'), 'w') as f:
         json.dump(final_metrics, f, indent=4)
@@ -248,9 +289,16 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train DQN with Experience Replay
-    print("Training DQN with Experience Replay...")
+    print("Training DQN with Experience Replay and Target Network...")
     scores, q_values, training_times, losses = train_dqn_with_replay(
-        env, model, optimizer, num_episodes=1000, visualize=False)
+        env, model, optimizer, 
+        num_episodes=1000, 
+        batch_size=32,
+        buffer_size=10000,
+        target_update_freq=100,  # Update target network every 100 steps
+        min_buffer_size=1000,    # Warm start with 1000 experiences
+        visualize=False
+    )
     
     # Evaluate trained model
     print("\nEvaluating trained model...")
