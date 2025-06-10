@@ -102,8 +102,35 @@ def train_dqn_with_exploration(env, agent, optimizer, exploration_strategy, num_
     # Initialize replay buffer
     replay_buffer = ReplayBuffer(capacity=buffer_size)
     
+    # Initialize target network
+    target_model = DQN().to(device)
+    target_model.load_state_dict(model.state_dict())
+    target_model.eval()
+    
+    # Step counter for target network updates
+    step_counter = 0
+    
     if visualize:
         visualizer = SnakeVisualizer(env.width, env.height)
+    
+    # Initial Population (Warm Start): Fill buffer with random experiences
+    print(f"Warming up replay buffer with {min_buffer_size} experiences...")
+    state, _, done, _ = env.reset()
+    
+    while len(replay_buffer) < min_buffer_size:
+        # Use random action for warm start
+        action = np.random.randint(-1, 2)
+        next_state, reward, done, _ = env.step(action)
+        
+        # Store experience in replay buffer
+        replay_buffer.add(state, action, reward, next_state, done)
+        
+        state = next_state if not done else env.reset()[0]
+        
+        if len(replay_buffer) % 100 == 0:
+            print(f"Buffer filled: {len(replay_buffer)}/{min_buffer_size}")
+    
+    print(f"Warm-up complete! Buffer size: {len(replay_buffer)}")
     
     for episode in range(num_episodes):
         state, _, done, _ = env.reset()
@@ -136,8 +163,11 @@ def train_dqn_with_exploration(env, agent, optimizer, exploration_strategy, num_
             # Store experience in replay buffer
             replay_buffer.add(state, action, reward, next_state, done)
             
+            # Increment step counter
+            step_counter += 1
+            
             # Train on batch if buffer has enough samples
-            if len(replay_buffer) >= batch_size:
+            if replay_buffer.can_sample(batch_size):
                 # Sample batch from replay buffer
                 batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = replay_buffer.sample(batch_size)
                 
@@ -182,7 +212,8 @@ def train_dqn_with_exploration(env, agent, optimizer, exploration_strategy, num_
                 'exploration': float(exploration_metrics[-1]),
                 'avg_loss': float(np.mean(episode_losses) if episode_losses else 0),
                 'training_time': float(training_time),
-                'buffer_size': len(replay_buffer)
+                'buffer_size': len(replay_buffer),
+                'step_counter': step_counter
             }
             with open(os.path.join(results_dir, 'metrics.json'), 'a') as f:
                 json.dump(metrics, f)
