@@ -11,6 +11,7 @@ import os
 import json
 from datetime import datetime
 from replay_buffer import ReplayBuffer
+from exploration_strategies import EpsilonGreedyStrategy, BoltzmannStrategy
 
 # Set device for GPU acceleration if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,21 +39,64 @@ class DQN(nn.Module):
         x = torch.relu(self.fc1(x))
         return self.fc2(x)
 
+class DQNAgent:
+    def __init__(self, input_channels=3, num_actions=3, target_update_frequency=10):
+        self.policy_net = DQN(input_channels, num_actions).to(device)
+        self.target_net = DQN(input_channels, num_actions).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()  # Target network is always in eval mode
+        self.target_update_frequency = target_update_frequency
+        self.steps = 0
+        
+    def update_target_network(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+    def get_action(self, state, exploration_strategy, episode):
+        with torch.no_grad():
+            q_values = self.policy_net(state)
+            return exploration_strategy.get_action(q_values[0], episode)
+            
+    def train_step(self, batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones, optimizer, gamma):
+        # Compute current Q values
+        current_q_values = self.policy_net(batch_states).gather(1, batch_actions.unsqueeze(1))
+        
+        # Compute next Q values using target network
+        with torch.no_grad():
+            next_q_values = self.target_net(batch_next_states).max(1)[0]
+            target_q_values = batch_rewards + (gamma * next_q_values * ~batch_dones)
+        
+        # Compute loss
+        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        
+        # Optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Update target network periodically
+        self.steps += 1
+        if self.steps % self.target_update_frequency == 0:
+            self.update_target_network()
+            
+        return loss.item()
+
 def preprocess_state(state):
     # Convert to torch tensor and normalize to [0,1], move to device
     state_tensor = torch.FloatTensor(state).permute(2, 0, 1).to(device) / 255.0
     return state_tensor.unsqueeze(0)  # Add batch dimension
 
-def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99, 
-                         batch_size=32, buffer_size=10000, visualize=False):
+def train_dqn_with_exploration(env, agent, optimizer, exploration_strategy, num_episodes=1000, gamma=0.99, 
+                              batch_size=32, buffer_size=10000, visualize=False):
     scores = []
     q_values = []
     training_times = []
     losses = []
+    exploration_metrics = []
     
     # Create directory for saving results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = f"dqn_replay_results_{timestamp}"
+    strategy_name = exploration_strategy.__class__.__name__
+    results_dir = f"dqn_{strategy_name.lower()}_results_{timestamp}"
     os.makedirs(results_dir, exist_ok=True)
     
     # Initialize replay buffer
@@ -71,7 +115,7 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
         while not done:
             if visualize:
                 if not visualizer.handle_events():
-                    return scores, q_values, training_times, losses
+                    return scores, q_values, training_times, losses, exploration_metrics
                 visualizer.draw_board(state)
                 time.sleep(0.1)  # Slow down visualization
             
@@ -79,15 +123,11 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
             state_tensor = preprocess_state(state)
             
             # Get Q-values
-            current_q_values = model(state_tensor)
+            current_q_values = agent.policy_net(state_tensor)
             episode_q_values.append(current_q_values.mean().item())
             
-            # Choose action using epsilon-greedy policy (decaying epsilon)
-            epsilon = max(0.01, 0.1 - episode * 0.00009)  # Decay from 0.1 to 0.01
-            if np.random.random() < epsilon:
-                action = np.random.randint(-1, 2)
-            else:
-                action = torch.argmax(current_q_values).item() - 1
+            # Choose action using exploration strategy
+            action = agent.get_action(state_tensor, exploration_strategy, episode)
             
             # Take action
             next_state, reward, done, info = env.step(action)
@@ -108,22 +148,10 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
                 batch_next_states = torch.FloatTensor(batch_next_states).permute(0, 3, 1, 2).to(device) / 255.0
                 batch_dones = torch.BoolTensor(batch_dones).to(device)
                 
-                # Compute current Q values
-                current_q_values = model(batch_states).gather(1, batch_actions.unsqueeze(1))
-                
-                # Compute next Q values
-                with torch.no_grad():
-                    next_q_values = model(batch_next_states).max(1)[0]
-                    target_q_values = batch_rewards + (gamma * next_q_values * ~batch_dones)
-                
-                # Compute loss
-                loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
-                episode_losses.append(loss.item())
-                
-                # Optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                # Train step
+                loss = agent.train_step(batch_states, batch_actions, batch_rewards, 
+                                      batch_next_states, batch_dones, optimizer, gamma)
+                episode_losses.append(loss)
             
             state = next_state
         
@@ -133,10 +161,17 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
         training_times.append(training_time)
         losses.append(np.mean(episode_losses) if episode_losses else 0)
         
+        # Record exploration metric
+        if isinstance(exploration_strategy, EpsilonGreedyStrategy):
+            exploration_metrics.append(exploration_strategy.get_epsilon())
+        else:  # BoltzmannStrategy
+            exploration_metrics.append(exploration_strategy.get_temperature())
+        
         if episode % 10 == 0:
             print(f"Episode {episode}, Score: {episode_score}, "
                   f"Avg Q-value: {np.mean(episode_q_values):.2f}, "
-                  f"Epsilon: {epsilon:.4f}, Loss: {np.mean(episode_losses) if episode_losses else 0:.4f}, "
+                  f"Exploration: {exploration_metrics[-1]:.4f}, "
+                  f"Loss: {np.mean(episode_losses) if episode_losses else 0:.4f}, "
                   f"Time: {training_time:.2f}s")
             
             # Save metrics every 10 episodes
@@ -144,7 +179,7 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
                 'episode': episode,
                 'score': episode_score,
                 'avg_q_value': float(np.mean(episode_q_values)),
-                'epsilon': float(epsilon),
+                'exploration': float(exploration_metrics[-1]),
                 'avg_loss': float(np.mean(episode_losses) if episode_losses else 0),
                 'training_time': float(training_time),
                 'buffer_size': len(replay_buffer)
@@ -157,112 +192,159 @@ def train_dqn_with_replay(env, model, optimizer, num_episodes=1000, gamma=0.99,
         pygame.quit()
     
     # Save final model
-    torch.save(model.state_dict(), os.path.join(results_dir, 'model.pth'))
+    torch.save(agent.policy_net.state_dict(), os.path.join(results_dir, 'model.pth'))
     
     # Create and save plots
     plt.figure(figsize=(20, 5))
     
-    plt.subplot(1, 4, 1)
+    plt.subplot(1, 5, 1)
     plt.plot(scores)
-    plt.title('Training Scores (with Experience Replay)')
+    plt.title(f'Training Scores ({strategy_name})')
     plt.xlabel('Episode')
     plt.ylabel('Score')
     plt.savefig(os.path.join(results_dir, 'scores.png'))
     
-    plt.subplot(1, 4, 2)
+    plt.subplot(1, 5, 2)
     plt.plot(q_values)
-    plt.title('Average Q-values (with Experience Replay)')
+    plt.title(f'Average Q-values ({strategy_name})')
     plt.xlabel('Episode')
     plt.ylabel('Q-value')
     plt.savefig(os.path.join(results_dir, 'q_values.png'))
     
-    plt.subplot(1, 4, 3)
+    plt.subplot(1, 5, 3)
     plt.plot(losses)
-    plt.title('Training Loss (with Experience Replay)')
+    plt.title(f'Training Loss ({strategy_name})')
     plt.xlabel('Episode')
     plt.ylabel('Loss')
     plt.savefig(os.path.join(results_dir, 'losses.png'))
     
-    plt.subplot(1, 4, 4)
+    plt.subplot(1, 5, 4)
     plt.plot(training_times)
-    plt.title('Training Times (with Experience Replay)')
+    plt.title(f'Training Times ({strategy_name})')
     plt.xlabel('Episode')
     plt.ylabel('Time (s)')
     plt.savefig(os.path.join(results_dir, 'training_times.png'))
     
+    plt.subplot(1, 5, 5)
+    plt.plot(exploration_metrics)
+    plt.title(f'Exploration Schedule ({strategy_name})')
+    plt.xlabel('Episode')
+    plt.ylabel('Epsilon/Temperature')
+    plt.savefig(os.path.join(results_dir, 'exploration.png'))
+    
     plt.close()
     
-    # Save final metrics
-    final_metrics = {
-        'final_score': float(np.mean(scores[-100:])),  # Last 100 episodes
-        'final_q_value': float(np.mean(q_values[-100:])),
-        'final_loss': float(np.mean(losses[-100:])),
-        'total_training_time': float(np.sum(training_times)),
-        'num_episodes': num_episodes,
-        'buffer_size': buffer_size,
-        'batch_size': batch_size
-    }
-    with open(os.path.join(results_dir, 'final_metrics.json'), 'w') as f:
-        json.dump(final_metrics, f, indent=4)
-    
-    return scores, q_values, training_times, losses
+    return scores, q_values, training_times, losses, exploration_metrics
 
-def evaluate_model(model, env, num_episodes=100, visualize=False):
-    """Evaluate the trained model over multiple episodes"""
-    scores = []
-    visualizer = SnakeVisualizer(env.width, env.height) if visualize else None
+def compare_target_network():
+    # Initialize environment
+    env = SnakeGame(32, 32)
     
-    for episode in range(num_episodes):
-        state, _, done, _ = env.reset()
-        episode_score = 0
-        
-        while not done:
-            if visualize:
-                if not visualizer.handle_events():
-                    break
-                visualizer.draw_board(state)
-                time.sleep(0.1)
-            
-            # Get action from model
-            state_tensor = preprocess_state(state)
-            with torch.no_grad():
-                q_values = model(state_tensor)
-            action = torch.argmax(q_values).item() - 1
-            
-            # Take action
-            state, reward, done, _ = env.step(action)
-            episode_score += reward
-        
-        scores.append(episode_score)
-        print(f"Evaluation Episode {episode}, Score: {episode_score}")
+    # Create results directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = f"target_network_comparison_{timestamp}"
+    os.makedirs(results_dir, exist_ok=True)
     
-    if visualize:
-        pygame.quit()
+    # Train with target network
+    print("\nTraining with target network...")
+    target_agent = DQNAgent(target_update_frequency=10)
+    target_optimizer = optim.Adam(target_agent.policy_net.parameters(), lr=0.001)
+    target_strategy = EpsilonGreedyStrategy(initial_epsilon=1.0, final_epsilon=0.01)
     
-    return scores
+    target_results = train_dqn_with_exploration(
+        env, target_agent, target_optimizer, 
+        target_strategy, num_episodes=1000, visualize=False
+    )
+    
+    # Train without target network (using policy network for both current and next Q-values)
+    print("\nTraining without target network...")
+    no_target_agent = DQNAgent(target_update_frequency=float('inf'))  # Never update target network
+    no_target_optimizer = optim.Adam(no_target_agent.policy_net.parameters(), lr=0.001)
+    no_target_strategy = EpsilonGreedyStrategy(initial_epsilon=1.0, final_epsilon=0.01)
+    
+    no_target_results = train_dqn_with_exploration(
+        env, no_target_agent, no_target_optimizer,
+        no_target_strategy, num_episodes=1000, visualize=False
+    )
+    
+    # Compare results
+    plt.figure(figsize=(15, 10))
+    
+    # Plot scores
+    plt.subplot(2, 2, 1)
+    plt.plot(target_results[0], label='With Target Network')
+    plt.plot(no_target_results[0], label='Without Target Network')
+    plt.title('Training Scores Comparison')
+    plt.xlabel('Episode')
+    plt.ylabel('Score')
+    plt.legend()
+    
+    # Plot Q-values
+    plt.subplot(2, 2, 2)
+    plt.plot(target_results[1], label='With Target Network')
+    plt.plot(no_target_results[1], label='Without Target Network')
+    plt.title('Average Q-values Comparison')
+    plt.xlabel('Episode')
+    plt.ylabel('Q-value')
+    plt.legend()
+    
+    # Plot losses
+    plt.subplot(2, 2, 3)
+    plt.plot(target_results[3], label='With Target Network')
+    plt.plot(no_target_results[3], label='Without Target Network')
+    plt.title('Training Loss Comparison')
+    plt.xlabel('Episode')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # Plot training times
+    plt.subplot(2, 2, 4)
+    plt.plot(target_results[2], label='With Target Network')
+    plt.plot(no_target_results[2], label='Without Target Network')
+    plt.title('Training Time Comparison')
+    plt.xlabel('Episode')
+    plt.ylabel('Time (s)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, 'target_network_comparison.png'))
+    plt.close()
+    
+    # Save comparison metrics
+    comparison_metrics = {
+        'with_target': {
+            'final_score': float(np.mean(target_results[0][-100:])),
+            'final_q_value': float(np.mean(target_results[1][-100:])),
+            'final_loss': float(np.mean(target_results[3][-100:])),
+            'total_training_time': float(np.sum(target_results[2]))
+        },
+        'without_target': {
+            'final_score': float(np.mean(no_target_results[0][-100:])),
+            'final_q_value': float(np.mean(no_target_results[1][-100:])),
+            'final_loss': float(np.mean(no_target_results[3][-100:])),
+            'total_training_time': float(np.sum(no_target_results[2]))
+        }
+    }
+    
+    with open(os.path.join(results_dir, 'target_network_comparison_metrics.json'), 'w') as f:
+        json.dump(comparison_metrics, f, indent=4)
+    
+    # Print comparison results
+    print("\nComparison Results:")
+    print("\nWith Target Network:")
+    print(f"Final Score: {comparison_metrics['with_target']['final_score']:.2f}")
+    print(f"Final Q-value: {comparison_metrics['with_target']['final_q_value']:.2f}")
+    print(f"Final Loss: {comparison_metrics['with_target']['final_loss']:.4f}")
+    print(f"Total Training Time: {comparison_metrics['with_target']['total_training_time']:.2f}s")
+    
+    print("\nWithout Target Network:")
+    print(f"Final Score: {comparison_metrics['without_target']['final_score']:.2f}")
+    print(f"Final Q-value: {comparison_metrics['without_target']['final_q_value']:.2f}")
+    print(f"Final Loss: {comparison_metrics['without_target']['final_loss']:.4f}")
+    print(f"Total Training Time: {comparison_metrics['without_target']['total_training_time']:.2f}s")
 
 def main():
-    # Initialize environment and model
-    env = SnakeGame(32, 32)
-    model = DQN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # Train DQN with Experience Replay
-    print("Training DQN with Experience Replay...")
-    scores, q_values, training_times, losses = train_dqn_with_replay(
-        env, model, optimizer, num_episodes=1000, visualize=False)
-    
-    # Evaluate trained model
-    print("\nEvaluating trained model...")
-    eval_scores = evaluate_model(model, env, num_episodes=100, visualize=False)
-    
-    # Print results
-    print("\nResults:")
-    print(f"DQN with Replay Average Score: {np.mean(scores):.2f}")
-    print(f"DQN with Replay Average Q-value: {np.mean(q_values):.2f}")
-    print(f"DQN with Replay Average Loss: {np.mean(losses):.4f}")
-    print(f"DQN with Replay Average Training Time: {np.mean(training_times):.2f}s")
-    print(f"Evaluation Average Score: {np.mean(eval_scores):.2f}")
+    compare_target_network()
 
 if __name__ == "__main__":
     main() 

@@ -1,0 +1,14 @@
+{
+    "with_target": {
+        "final_score": -1.0,
+        "final_q_value": -0.688987452133637,
+        "final_loss": 0.005261216365150077,
+        "total_training_time": 1411.4805738925934
+    },
+    "without_target": {
+        "final_score": -0.99,
+        "final_q_value": -0.013746603103367935,
+        "final_loss": 0.036802032702466854,
+        "total_training_time": 1710.2388381958008
+    }
+}
